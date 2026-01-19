@@ -26,7 +26,7 @@ Download the pre-trained XSeg ONNX model:
 
 | Model | Size | Download |
 |-------|------|----------|
-| XSeg | 67 MB | [xseg.onnx](https://github.com/yakhyo/face-segmentation/releases/download/weights/xseg.onnx) |
+| XSeg | 70 MB | [xseg.onnx](https://github.com/yakhyo/face-segmentation/releases/download/weights/xseg.onnx) |
 
 Place the downloaded model in the `weights/` directory.
 
