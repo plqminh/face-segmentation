@@ -139,7 +139,7 @@ class XSeg:
 
         return mask
 
-    def parse(self, image: np.ndarray, landmarks: np.ndarray) -> np.ndarray:
+    def parse(self, image: np.ndarray, landmarks: np.ndarray, **kwargs) -> np.ndarray:
         """
         Perform face segmentation using 5-point landmarks for alignment.
 

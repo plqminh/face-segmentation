@@ -10,8 +10,9 @@ import glob
 from PIL import Image, ImageTk
 
 from uniface import RetinaFace
-from models import XSeg
+from models import MODEL_REGISTRY, HandOcclusionDetector
 
+# Ensure CUDA DLLs are dynamically reachable
 def setup_cuda_dlls():
     import sys
     paths_to_add = []
@@ -30,18 +31,19 @@ def setup_cuda_dlls():
 
 setup_cuda_dlls()
 
-DEFAULT_MODEL_PATH = "weights/xseg.onnx"
 
 class FaceSegmentationApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Face Segmentation - Offline GUI")
-        self.root.geometry("1100x750")
-        self.root.minsize(800, 600)
+        self.root.title("Face Segmentation - Offline GUI (SOTA Models)")
+        self.root.geometry("1100x780")
+        self.root.minsize(850, 600)
         
         # Models
         self.detector = None
         self.parser = None
+        self.parser_model_name = None
+        self.hand_detector = None
         
         # State
         self.image_path = None
@@ -53,11 +55,11 @@ class FaceSegmentationApp:
         self.setup_ui()
         
     def setup_ui(self):
-        # Left Panel (Controls) - use a canvas with scrollbar for overflow
-        left_wrapper = tk.Frame(self.root, width=300)
+        # Left Panel (Controls) - Canvas with scrollbar for responsive layout
+        left_wrapper = tk.Frame(self.root, width=320)
         left_wrapper.pack(side=tk.LEFT, fill=tk.Y)
         
-        left_canvas = tk.Canvas(left_wrapper, width=280, highlightthickness=0)
+        left_canvas = tk.Canvas(left_wrapper, width=300, highlightthickness=0)
         scrollbar = ttk.Scrollbar(left_wrapper, orient=tk.VERTICAL, command=left_canvas.yview)
         control_frame = tk.Frame(left_canvas, padx=15, pady=15)
         
@@ -68,22 +70,50 @@ class FaceSegmentationApp:
         left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Enable mousewheel scrolling
         def _on_mousewheel(event):
-            left_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         left_canvas.bind_all("<MouseWheel>", _on_mousewheel)
         
-        tk.Label(control_frame, text="Model Path:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-        self.model_path_var = tk.StringVar(value=DEFAULT_MODEL_PATH)
+        # --- Model Selection ---
+        tk.Label(control_frame, text="Model Architecture:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+        default_model_key = list(MODEL_REGISTRY.keys())[0]
+        self._last_selected_model = default_model_key
+        self._prev_exclude_hands = True
+        self._prev_exclude_tongue = True
+        self.model_arch_var = tk.StringVar(value=default_model_key)
+        self.model_combo = ttk.Combobox(
+            control_frame,
+            textvariable=self.model_arch_var,
+            values=list(MODEL_REGISTRY.keys()),
+            state="readonly",
+            width=30,
+        )
+        self.model_combo.pack(anchor=tk.W, pady=(2, 4))
+        self.model_combo.bind("<<ComboboxSelected>>", self.on_model_selected)
+        
+        # Model description
+        self.model_desc_var = tk.StringVar(value=MODEL_REGISTRY[default_model_key]["description"])
+        tk.Label(
+            control_frame,
+            textvariable=self.model_desc_var,
+            fg="#555555",
+            wraplength=270,
+            justify=tk.LEFT,
+            font=("Arial", 8),
+        ).pack(anchor=tk.W, pady=(0, 10))
+        
+        tk.Label(control_frame, text="Model Weight Path:", font=("Arial", 9, "bold")).pack(anchor=tk.W)
+        self.model_path_var = tk.StringVar(value=MODEL_REGISTRY[default_model_key]["default_weight"])
         tk.Entry(control_frame, textvariable=self.model_path_var, width=35).pack(anchor=tk.W, pady=(0, 10))
         
-        tk.Label(control_frame, text="Blur Sigma (Smoothing):", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+        tk.Label(control_frame, text="Align / Resolution Size:", font=("Arial", 9, "bold")).pack(anchor=tk.W)
+        default_align = MODEL_REGISTRY[default_model_key].get("align_size", 512)
+        self.align_var = tk.IntVar(value=default_align)
+        tk.Scale(control_frame, variable=self.align_var, from_=112, to=512, resolution=16, orient=tk.HORIZONTAL, length=200).pack(anchor=tk.W, pady=(0, 10))
+        
+        tk.Label(control_frame, text="Blur Sigma (Pre-smoothing):", font=("Arial", 9, "bold")).pack(anchor=tk.W)
         self.blur_var = tk.DoubleVar(value=0.0)
         tk.Scale(control_frame, variable=self.blur_var, from_=0, to=10, resolution=0.1, orient=tk.HORIZONTAL, length=200).pack(anchor=tk.W, pady=(0, 10))
-        
-        tk.Label(control_frame, text="Align Size:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-        self.align_var = tk.IntVar(value=256)
-        tk.Scale(control_frame, variable=self.align_var, from_=112, to=512, resolution=16, orient=tk.HORIZONTAL, length=200).pack(anchor=tk.W, pady=(0, 10))
         
         # --- Mask Controls ---
         sep1 = ttk.Separator(control_frame, orient=tk.HORIZONTAL)
@@ -92,6 +122,33 @@ class FaceSegmentationApp:
         
         self.largest_face_var = tk.BooleanVar(value=True)
         tk.Checkbutton(control_frame, text="Largest face only", variable=self.largest_face_var).pack(anchor=tk.W)
+        
+        self.include_features_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            control_frame,
+            text="Include Features (Nose/Eyes/Lips)",
+            variable=self.include_features_var,
+        ).pack(anchor=tk.W)
+        
+        self.include_neck_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(control_frame, text="Include Neck Skin", variable=self.include_neck_var).pack(anchor=tk.W)
+        
+        self.exclude_hands_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            control_frame,
+            text="Mask Out Hands (Cut out fingers/hands)",
+            variable=self.exclude_hands_var,
+        ).pack(anchor=tk.W)
+        
+        self.exclude_tongue_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            control_frame,
+            text="Mask Out Tongue & Inner Mouth",
+            variable=self.exclude_tongue_var,
+        ).pack(anchor=tk.W)
+        if "xseg" in default_model_key.lower():
+            self.exclude_hands_var.set(False)
+            self.exclude_tongue_var.set(False)
         
         self.invert_mask_var = tk.BooleanVar(value=False)
         tk.Checkbutton(control_frame, text="Invert mask", variable=self.invert_mask_var).pack(anchor=tk.W)
@@ -104,7 +161,7 @@ class FaceSegmentationApp:
         self.erode_dilate_var = tk.IntVar(value=0)
         tk.Scale(control_frame, variable=self.erode_dilate_var, from_=-50, to=50, resolution=1, orient=tk.HORIZONTAL, length=200).pack(anchor=tk.W)
         
-        tk.Label(control_frame, text="Feather (px):").pack(anchor=tk.W, pady=(5, 0))
+        tk.Label(control_frame, text="Feather (Soft Edge px):").pack(anchor=tk.W, pady=(5, 0))
         self.feather_var = tk.IntVar(value=0)
         tk.Scale(control_frame, variable=self.feather_var, from_=0, to=50, resolution=1, orient=tk.HORIZONTAL, length=200).pack(anchor=tk.W)
         
@@ -118,6 +175,17 @@ class FaceSegmentationApp:
         tk.Label(control_frame, text="Save Options:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
         self.save_overlay_var = tk.BooleanVar(value=False)
         tk.Checkbutton(control_frame, text="Save Overlay Result", variable=self.save_overlay_var).pack(anchor=tk.W)
+        
+        overlay_sub_frame = tk.Frame(control_frame)
+        overlay_sub_frame.pack(anchor=tk.W, padx=(15, 0), pady=(0, 2))
+        self.separate_overlay_folder_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(overlay_sub_frame, text="In folder:", variable=self.separate_overlay_folder_var).pack(side=tk.LEFT)
+        self.overlay_folder_name_var = tk.StringVar(value="overlays")
+        self.overlay_entry = tk.Entry(overlay_sub_frame, textvariable=self.overlay_folder_name_var, width=10)
+        self.overlay_entry.pack(side=tk.LEFT, padx=(2, 4))
+        self.overlay_browse_btn = tk.Button(overlay_sub_frame, text="Browse...", command=self.browse_overlay_dir, font=("Arial", 8))
+        self.overlay_browse_btn.pack(side=tk.LEFT)
+        
         self.save_mask_var = tk.BooleanVar(value=True)
         tk.Checkbutton(control_frame, text="Save Segmentation Mask", variable=self.save_mask_var).pack(anchor=tk.W, pady=(0, 5))
         
@@ -150,8 +218,8 @@ class FaceSegmentationApp:
         self.progress_bar = ttk.Progressbar(control_frame, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=(10, 5))
         
-        self.status_var = tk.StringVar(value="Ready. Please load an image or start batch.")
-        tk.Label(control_frame, textvariable=self.status_var, fg="#333333", wraplength=250, justify=tk.LEFT).pack(pady=10, anchor=tk.SW)
+        self.status_var = tk.StringVar(value="Ready. Select model and load an image.")
+        tk.Label(control_frame, textvariable=self.status_var, fg="#333333", wraplength=270, justify=tk.LEFT).pack(pady=10, anchor=tk.SW)
         
         # Right Panel (Images)
         image_frame = tk.Frame(self.root, bg="#2b2b2b")
@@ -182,6 +250,32 @@ class FaceSegmentationApp:
         
         # Resize event
         self.root.bind("<Configure>", self.on_resize)
+
+    def on_model_selected(self, event=None):
+        selected = self.model_arch_var.get()
+        info = MODEL_REGISTRY.get(selected)
+        if info:
+            self.model_desc_var.set(info.get("description", ""))
+            self.model_path_var.set(info.get("default_weight", ""))
+            if "align_size" in info:
+                self.align_var.set(info["align_size"])
+            self.status_var.set(f"Selected: {selected}")
+            
+            is_xseg = "xseg" in selected.lower()
+            prev_was_xseg = bool(getattr(self, "_last_selected_model", None) and "xseg" in self._last_selected_model.lower())
+            
+            if is_xseg:
+                if not prev_was_xseg:
+                    self._prev_exclude_hands = self.exclude_hands_var.get()
+                    self._prev_exclude_tongue = self.exclude_tongue_var.get()
+                self.exclude_hands_var.set(False)
+                self.exclude_tongue_var.set(False)
+            else:
+                if prev_was_xseg:
+                    self.exclude_hands_var.set(getattr(self, "_prev_exclude_hands", True))
+                    self.exclude_tongue_var.set(getattr(self, "_prev_exclude_tongue", True))
+                    
+            self._last_selected_model = selected
         
     def stop_processing(self):
         self.stop_requested = True
@@ -221,7 +315,7 @@ class FaceSegmentationApp:
         canvas.update_idletasks()
         w, h = canvas.winfo_width(), canvas.winfo_height()
         if w > 10 and h > 10:
-            ratio = min(w/pil_img.width, h/pil_img.height)
+            ratio = min(w / pil_img.width, h / pil_img.height)
             new_size = (int(pil_img.width * ratio), int(pil_img.height * ratio))
             pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
             
@@ -246,9 +340,12 @@ class FaceSegmentationApp:
         
     def download_weights_if_needed(self, model_path):
         if not os.path.exists(model_path):
-            self.root.after(0, lambda: self.status_var.set("Downloading model weights... (This may take a moment)"))
-            url = "https://github.com/yakhyo/face-segmentation/releases/download/weights/xseg.onnx"
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            self.root.after(0, lambda: self.status_var.set(f"Downloading model weights for {os.path.basename(model_path)}..."))
+            selected = self.model_arch_var.get()
+            url = MODEL_REGISTRY.get(selected, {}).get("url")
+            if not url:
+                url = "https://github.com/yakhyo/face-segmentation/releases/download/weights/xseg.onnx"
+            os.makedirs(os.path.dirname(model_path) if os.path.dirname(model_path) else ".", exist_ok=True)
             urllib.request.urlretrieve(url, model_path)
             self.root.after(0, lambda: self.status_var.set("Download complete!"))
 
@@ -269,12 +366,37 @@ class FaceSegmentationApp:
             
         blur = self.blur_var.get()
         align = self.align_var.get()
+        selected_model_name = self.model_arch_var.get()
         
-        if self.parser is None or getattr(self.parser, 'model_path', None) != model_path or self.parser.align_size != align or self.parser.blur_sigma != blur or getattr(self.parser, '_cuda_setting', None) != use_cuda:
-            self.root.after(0, lambda: self.status_var.set("Initializing XSeg model..."))
-            self.parser = XSeg(model_path, align_size=align, blur_sigma=blur, providers=providers)
+        needs_reload = (
+            self.parser is None
+            or self.parser_model_name != selected_model_name
+            or getattr(self.parser, 'model_path', None) != model_path
+            or getattr(self.parser, 'align_size', None) != align
+            or getattr(self.parser, 'blur_sigma', None) != blur
+            or getattr(self.parser, '_cuda_setting', None) != use_cuda
+        )
+        
+        if needs_reload:
+            self.root.after(0, lambda: self.status_var.set(f"Initializing {selected_model_name}..."))
+            model_info = MODEL_REGISTRY.get(selected_model_name, list(MODEL_REGISTRY.values())[0])
+            model_cls = model_info["class"]
+            self.parser = model_cls(model_path, align_size=align, blur_sigma=blur, providers=providers)
             self.parser.model_path = model_path
             self.parser._cuda_setting = use_cuda
+            self.parser_model_name = selected_model_name
+
+        hand_needs_reload = (
+            self.hand_detector is None
+            or getattr(self.hand_detector, '_cuda_setting', None) != use_cuda
+        )
+        if self.exclude_hands_var.get() and hand_needs_reload:
+            self.root.after(0, lambda: self.status_var.set("Initializing YOLO Hand Detector..."))
+            self.hand_detector = HandOcclusionDetector(
+                yolo_model_path="weights/yolo26m-seg-hand.onnx",
+                providers=providers,
+            )
+            self.hand_detector._cuda_setting = use_cuda
 
     def postprocess_mask(self, mask):
         """Apply threshold, erode/dilate, feather, opacity, and invert to a float32 mask."""
@@ -327,13 +449,28 @@ class FaceSegmentationApp:
             faces = [max(faces, key=face_area)]
             
         full_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
+        include_features = self.include_features_var.get()
+        include_neck = self.include_neck_var.get()
+        exclude_tongue = self.exclude_tongue_var.get()
         
         for face in faces:
             landmarks = face.landmarks
             if landmarks is None or landmarks.shape[0] != 5:
                 continue
-            mask = self.parser.parse(image, landmarks)
+            mask = self.parser.parse(
+                image,
+                landmarks,
+                include_features=include_features,
+                include_neck=include_neck,
+                exclude_tongue=exclude_tongue,
+            )
             full_mask = np.maximum(full_mask, mask)
+            
+        # Subtract hand occlusions if detected
+        if self.exclude_hands_var.get() and self.hand_detector is not None:
+            hand_mask = self.hand_detector.detect_hand_mask(image)
+            if hand_mask is not None:
+                full_mask = full_mask * (1.0 - hand_mask)
         
         # Apply mask post-processing
         full_mask = self.postprocess_mask(full_mask)
@@ -387,6 +524,22 @@ class FaceSegmentationApp:
             self.root.after(0, lambda: self.load_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.batch_btn.config(state=tk.NORMAL))
             
+    def browse_overlay_dir(self):
+        d = filedialog.askdirectory(title="Select Folder for Overlays")
+        if d:
+            self.overlay_folder_name_var.set(d)
+            self.separate_overlay_folder_var.set(True)
+
+    def get_overlay_output_dir(self, base_output_dir):
+        if not self.separate_overlay_folder_var.get():
+            return base_output_dir
+        val = self.overlay_folder_name_var.get().strip()
+        if not val:
+            return base_output_dir
+        if os.path.isabs(val):
+            return val
+        return os.path.join(base_output_dir, val)
+
     def save_results(self):
         if self.result_image is None or self.image_path is None:
             return
@@ -396,7 +549,7 @@ class FaceSegmentationApp:
             return
             
         base_name_only = os.path.basename(self.image_path).rsplit(".", 1)[0]
-        default_name = base_name_only + ("_result.png" if self.save_overlay_var.get() else "_mask.png")
+        default_name = base_name_only + ("_mask.png" if self.save_mask_var.get() else "_result.png")
         
         save_path = filedialog.asksaveasfilename(
             initialfile=default_name,
@@ -411,17 +564,19 @@ class FaceSegmentationApp:
             elif chosen_name.endswith("_mask"): chosen_name = chosen_name[:-5]
             
             saved_items = []
-            if self.save_overlay_var.get():
-                res_path = os.path.join(base_dir, f"{chosen_name}_result.png")
-                cv2.imwrite(res_path, self.result_image)
-                saved_items.append("Overlay Result")
-                
             if self.save_mask_var.get():
                 mask_path = os.path.join(base_dir, f"{chosen_name}_mask.png")
                 cv2.imwrite(mask_path, self.mask_image)
-                saved_items.append("Segmentation Mask")
+                saved_items.append(f"Mask: {mask_path}")
+
+            if self.save_overlay_var.get():
+                target_overlay_dir = self.get_overlay_output_dir(base_dir) if self.save_mask_var.get() else base_dir
+                os.makedirs(target_overlay_dir, exist_ok=True)
+                res_path = os.path.join(target_overlay_dir, f"{chosen_name}_result.png")
+                cv2.imwrite(res_path, self.result_image)
+                saved_items.append(f"Overlay: {res_path}")
                 
-            messagebox.showinfo("Success", f"Saved: {', '.join(saved_items)}\nTo: {base_dir}")
+            messagebox.showinfo("Success", f"Saved successfully:\n\n" + "\n".join(saved_items))
 
     def batch_process_thread(self):
         if not self.save_overlay_var.get() and not self.save_mask_var.get():
@@ -454,7 +609,6 @@ class FaceSegmentationApp:
                 if f.lower().endswith(image_extensions):
                     image_files.append(os.path.join(input_dir, f))
 
-                
             if not image_files:
                 self.root.after(0, lambda: messagebox.showinfo("Info", "No images found in the selected directory."))
                 self.root.after(0, lambda: self.status_var.set("Batch processing cancelled (no images)."))
@@ -485,13 +639,15 @@ class FaceSegmentationApp:
                     original_name = os.path.basename(img_path)
                     base_name = original_name.rsplit(".", 1)[0]
                     
-                    if save_overlay:
-                        res_path = os.path.join(output_dir, f"{base_name}_result.png")
-                        cv2.imwrite(res_path, res_img)
-                        
                     if save_mask:
                         mask_path = os.path.join(output_dir, original_name)
                         cv2.imwrite(mask_path, mask_img)
+
+                    if save_overlay:
+                        target_overlay_dir = self.get_overlay_output_dir(output_dir) if save_mask else output_dir
+                        os.makedirs(target_overlay_dir, exist_ok=True)
+                        res_path = os.path.join(target_overlay_dir, f"{base_name}_result.png")
+                        cv2.imwrite(res_path, res_img)
                         
                     success_count += 1
                 
@@ -499,7 +655,13 @@ class FaceSegmentationApp:
                 progress_pct = ((i + 1) / total) * 100
                 self.root.after(0, lambda pct=progress_pct: self.progress_var.set(pct))
                 
-            self.root.after(0, lambda: messagebox.showinfo("Batch Complete", f"Processed {total} images.\nSuccessfully segmented faces in {success_count} images.\nSaved to: {output_dir}"))
+            target_overlay_dir = self.get_overlay_output_dir(output_dir) if (save_overlay and save_mask) else output_dir
+            saved_msg = f"Processed {total} images.\nSuccessfully segmented faces in {success_count} images."
+            if save_mask:
+                saved_msg += f"\nMasks saved to: {output_dir}"
+            if save_overlay:
+                saved_msg += f"\nOverlays saved to: {target_overlay_dir}"
+            self.root.after(0, lambda: messagebox.showinfo("Batch Complete", saved_msg))
             self.root.after(0, lambda: self.status_var.set("Batch processing complete!"))
             
         except Exception as e:
